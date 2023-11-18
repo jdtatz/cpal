@@ -61,7 +61,7 @@ pub enum AudioClientFlow {
 }
 
 pub struct StreamInner {
-    pub audio_client: Audio::IAudioClient,
+    pub audio_client: Audio::IAudioClient2,
     pub audio_clock: Audio::IAudioClock,
     pub client_flow: AudioClientFlow,
     // Event that is signalled by WASAPI whenever audio data must be written.

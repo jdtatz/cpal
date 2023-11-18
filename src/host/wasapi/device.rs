@@ -36,7 +36,7 @@ pub type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>
 
 /// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
 #[derive(Clone)]
-struct IAudioClientWrapper(Audio::IAudioClient);
+struct IAudioClientWrapper(Audio::IAudioClient2);
 unsafe impl Send for IAudioClientWrapper {}
 unsafe impl Sync for IAudioClientWrapper {}
 
@@ -44,6 +44,8 @@ unsafe impl Sync for IAudioClientWrapper {}
 #[derive(Clone)]
 pub struct Device {
     device: Audio::IMMDevice,
+    category: Audio::AUDIO_STREAM_CATEGORY,
+    share_mode: Audio::AUDCLNT_SHAREMODE,
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
@@ -195,16 +197,14 @@ unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::ED
 
 // Given the audio client and format, returns whether or not the format is supported.
 pub unsafe fn is_format_supported(
-    client: &Audio::IAudioClient,
+    client: &Audio::IAudioClient2,
+    share_mode: Audio::AUDCLNT_SHAREMODE,
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
 ) -> Result<bool, SupportedStreamConfigsError> {
     // Check if the given format is supported.
     let is_supported = |waveformatex_ptr, closest_waveformatex_ptr| {
-        let result = client.IsFormatSupported(
-            Audio::AUDCLNT_SHAREMODE_SHARED,
-            waveformatex_ptr,
-            Some(closest_waveformatex_ptr),
-        );
+        let result =
+            client.IsFormatSupported(share_mode, waveformatex_ptr, Some(closest_waveformatex_ptr));
         // `IsFormatSupported` can return `S_FALSE` (which means that a compatible format
         // has been found, but not an exact match) so we also treat this as unsupported.
         match result {
@@ -242,7 +242,7 @@ pub unsafe fn is_format_supported(
 // Get a cpal Format from a WAVEFORMATEX.
 unsafe fn format_from_waveformatex_ptr(
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
-    audio_client: &Audio::IAudioClient,
+    audio_client: &Audio::IAudioClient2,
 ) -> Option<SupportedStreamConfig> {
     fn cmp_guid(a: &GUID, b: &GUID) -> bool {
         (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
@@ -282,27 +282,19 @@ unsafe fn format_from_waveformatex_ptr(
     //
     // https://docs.microsoft.com/en-us/windows-hardware/drivers/audio/hardware-offloaded-audio-processing
     let (mut min_buffer_duration, mut max_buffer_duration) = (0, 0);
-    let buffer_size_is_limited = audio_client
-        .cast::<Audio::IAudioClient2>()
-        .and_then(|audio_client| {
-            audio_client.GetBufferSizeLimits(
-                waveformatex_ptr,
-                true,
-                &mut min_buffer_duration,
-                &mut max_buffer_duration,
-            )
-        })
-        .is_ok();
-    let buffer_size = if buffer_size_is_limited {
-        SupportedBufferSize::Range {
+    let buffer_size_is_limited = audio_client.GetBufferSizeLimits(
+        waveformatex_ptr,
+        true,
+        &mut min_buffer_duration,
+        &mut max_buffer_duration,
+    );
+    let buffer_size = match buffer_size_is_limited {
+        Ok(()) => SupportedBufferSize::Range {
             min: buffer_duration_to_frames(min_buffer_duration, sample_rate.0),
             max: buffer_duration_to_frames(max_buffer_duration, sample_rate.0),
-        }
-    } else {
-        SupportedBufferSize::Range {
-            min: 0,
-            max: u32::max_value(),
-        }
+        },
+        Err(e) if e.code() == Audio::AUDCLNT_E_OFFLOAD_MODE_ONLY => SupportedBufferSize::Unknown,
+        Err(_) => return None,
     };
 
     let format = SupportedStreamConfig {
@@ -374,6 +366,9 @@ impl Device {
     fn from_immdevice(device: Audio::IMMDevice) -> Self {
         Device {
             device,
+            category: Audio::AudioCategory_Other,
+            share_mode: Audio::AUDCLNT_SHAREMODE_SHARED,
+            // share_mode: Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
             future_audio_client: Arc::new(Mutex::new(None)),
         }
     }
@@ -392,14 +387,22 @@ impl Device {
             // the device doesn't support playback for some reason
             self.device.Activate(Com::CLSCTX_ALL, None)?
         };
-
-        *lock = Some(IAudioClientWrapper(audio_client));
+        let audio_client2 = audio_client.cast::<Audio::IAudioClient2>()?;
+        let can_offload = unsafe { audio_client2.IsOffloadCapable(self.category) }?;
+        let properties = Audio::AudioClientProperties {
+            cbSize: std::mem::size_of::<Audio::AudioClientProperties>() as _,
+            bIsOffload: can_offload,
+            eCategory: self.category,
+            Options: Audio::AUDCLNT_STREAMOPTIONS_MATCH_FORMAT,
+        };
+        unsafe { audio_client2.SetClientProperties(&properties as _)? };
+        *lock = Some(IAudioClientWrapper(audio_client2));
         Ok(lock)
     }
 
     /// Returns an uninitialized `IAudioClient`.
     #[inline]
-    pub(crate) fn build_audioclient(&self) -> Result<Audio::IAudioClient, windows::core::Error> {
+    pub(crate) fn build_audioclient(&self) -> Result<Audio::IAudioClient2, windows::core::Error> {
         let mut lock = self.ensure_future_audio_client()?;
         Ok(lock.take().unwrap().0)
     }
@@ -441,7 +444,7 @@ impl Device {
                 .map_err(windows_err_to_cpal_err::<SupportedStreamConfigsError>)?;
 
             // If the default format can't succeed we have no hope of finding other formats.
-            if !is_format_supported(client, default_waveformatex_ptr.0)? {
+            if !is_format_supported(client, self.share_mode, default_waveformatex_ptr.0)? {
                 let description =
                     "Could not determine support for default `WAVEFORMATEX`".to_string();
                 let err = BackendSpecificError { description };
@@ -468,7 +471,7 @@ impl Device {
                 test_format.nSamplesPerSec = rate;
                 test_format.nAvgBytesPerSec =
                     rate * u32::from((*default_waveformatex_ptr.0).nBlockAlign);
-                if is_format_supported(client, test_format.as_ptr())? {
+                if is_format_supported(client, self.share_mode, test_format.as_ptr())? {
                     supported_sample_rates.push(rate);
                 }
             }
@@ -622,10 +625,13 @@ impl Device {
             let waveformatex = {
                 let format_attempt = config_to_waveformatextensible(config, sample_format)
                     .ok_or(BuildStreamError::StreamConfigNotSupported)?;
-                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
 
                 // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
+                match super::device::is_format_supported(
+                    &audio_client,
+                    self.share_mode,
+                    &format_attempt.Format,
+                ) {
                     Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
                     Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
                     _ => (),
@@ -633,7 +639,7 @@ impl Device {
 
                 // Finally, initializing the audio client
                 let hresult = audio_client.Initialize(
-                    share_mode,
+                    self.share_mode,
                     stream_flags,
                     buffer_duration,
                     0,
@@ -731,10 +737,13 @@ impl Device {
             let waveformatex = {
                 let format_attempt = config_to_waveformatextensible(config, sample_format)
                     .ok_or(BuildStreamError::StreamConfigNotSupported)?;
-                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
 
                 // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
+                match super::device::is_format_supported(
+                    &audio_client,
+                    self.share_mode,
+                    &format_attempt.Format,
+                ) {
                     Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
                     Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
                     _ => (),
@@ -743,7 +752,7 @@ impl Device {
                 // Finally, initializing the audio client
                 audio_client
                     .Initialize(
-                        share_mode,
+                        self.share_mode,
                         Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                         buffer_duration,
                         0,
@@ -978,7 +987,7 @@ pub fn default_output_device() -> Option<Device> {
 
 /// Get the audio clock used to produce `StreamInstant`s.
 unsafe fn get_audio_clock(
-    audio_client: &Audio::IAudioClient,
+    audio_client: &Audio::IAudioClient2,
 ) -> Result<Audio::IAudioClock, BuildStreamError> {
     audio_client
         .GetService::<Audio::IAudioClock>()
